@@ -1,9 +1,8 @@
 import re
-from itertools import permutations
 
 
 def extract_series_name(name: str) -> str:
-    m = re.match(r"^(.*?)[\s\-#]+\d+\s*$", name)
+    m = re.match(r"^(.*?)[\s\-#]+\d+\W*$", name)
     return m.group(1).strip() if m else name
 
 
@@ -42,46 +41,55 @@ def bracket_round1_opponent(seed: int, bracket_size: int) -> int:
     return bracket_size + 1 - seed
 
 
-def _count_conflicts(
+def _resolve_conflicts(
     ordered: list[str],
-    group_start: int,
-    group_end: int,
     matchups: set[frozenset[str]],
     bracket_size: int,
-) -> int:
-    seen: set[frozenset[str]] = set()
-    for seed in range(group_start, group_end + 1):
-        opp = bracket_round1_opponent(seed, bracket_size)
-        if group_start <= opp <= group_end:
-            pair = frozenset({ordered[seed - 1], ordered[opp - 1]})
-            if pair in matchups:
-                seen.add(pair)
-    return len(seen)
-
-
-def optimize_group(
-    ordered: list[str],
-    group_start: int,
-    group_end: int,
-    matchups: set[frozenset[str]],
-    bracket_size: int,
+    entrant_count: int,
+    locked: int = 2,
 ) -> list[str]:
-    group = ordered[group_start - 1 : group_end]
-    best = group[:]
-    best_count = _count_conflicts(ordered, group_start, group_end, matchups, bracket_size)
-    if best_count == 0:
-        return ordered
-
-    for perm in permutations(group):
-        candidate = ordered[: group_start - 1] + list(perm) + ordered[group_end:]
-        count = _count_conflicts(candidate, group_start, group_end, matchups, bracket_size)
-        if count < best_count:
-            best_count = count
-            best = list(perm)
-            if best_count == 0:
+    ordered = ordered[:]
+    for _ in range(entrant_count * 2):
+        # Find the first round-1 conflict among seeds locked+1 and beyond
+        conflict = None
+        for i in range(locked, entrant_count):
+            j = bracket_round1_opponent(i + 1, bracket_size) - 1
+            if locked <= j < entrant_count and frozenset({ordered[i], ordered[j]}) in matchups:
+                conflict = (min(i, j), max(i, j))
                 break
 
-    return ordered[: group_start - 1] + best + ordered[group_end:]
+        if conflict is None:
+            break
+
+        a, b = conflict  # a = higher seed (lower index), b = lower seed
+        # Try swapping b with other positions, nearest first to preserve score order
+        candidates = sorted(
+            [k for k in range(locked, entrant_count) if k != a and k != b],
+            key=lambda k: abs(k - b),
+        )
+
+        swapped = False
+        for k in candidates:
+            ordered[b], ordered[k] = ordered[k], ordered[b]
+            # Conflict at a resolved?
+            a_ok = frozenset({ordered[a], ordered[b]}) not in matchups
+            # New conflict created at k?
+            k_opp_i = bracket_round1_opponent(k + 1, bracket_size) - 1
+            k_ok = not (
+                locked <= k_opp_i < entrant_count
+                and frozenset({ordered[k], ordered[k_opp_i]}) in matchups
+            )
+            if a_ok and k_ok:
+                swapped = True
+                break
+            ordered[b], ordered[k] = ordered[k], ordered[b]
+
+        if not swapped:
+            # Can't resolve this conflict without creating another — skip and continue
+            # Move past this pair so we don't get stuck in an infinite loop
+            break
+
+    return ordered
 
 
 def build_seed_list(
@@ -93,12 +101,7 @@ def build_seed_list(
     ordered = sorted(scores, key=lambda t: scores[t], reverse=True)
     bracket_size = next_power_of_two(entrant_count)
 
-    # Seeds 1-4 are fixed; optimize groups of 4 from seed 5 onward
-    g = 5
-    while g <= entrant_count:
-        end = min(g + 3, entrant_count)
-        ordered = optimize_group(ordered, g, end, matchups, bracket_size)
-        g += 4
+    ordered = _resolve_conflicts(ordered, matchups, bracket_size, entrant_count, locked=2)
 
     result = []
     for i, tag in enumerate(ordered):
