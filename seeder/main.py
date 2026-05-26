@@ -49,6 +49,21 @@ def prompt_pick(console: Console, items: list[dict], fmt=None) -> dict:
         console.print("[red]Invalid choice, try again.[/red]")
 
 
+def _format_ago(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+    days = seconds // 86400
+    if days == 0:
+        return "today"
+    if days == 1:
+        return "yesterday"
+    if days < 60:
+        return f"{days} days ago"
+    if days < 365:
+        return f"{days // 30} months ago"
+    return f"{days // 365} years ago"
+
+
 def _fmt_tournament(t: dict) -> str:
     date = datetime.fromtimestamp(t["startAt"]).strftime("%b %d") if t.get("startAt") else ""
     return f"{t['name']}  [dim]{date}[/dim]"
@@ -71,7 +86,9 @@ def _main() -> None:
     token = os.environ.get("STARTGG_TOKEN") or Prompt.ask("API token", password=True)
     client = StartGGClient(token)
 
-    url = (sys.argv[1] if len(sys.argv) > 1 else None) or os.environ.get("STARTGG_URL")
+    positional = [a for a in sys.argv[1:] if a not in ("-v", "--verbose")]
+    verbose = any(a in ("-v", "--verbose") for a in sys.argv[1:])
+    url = (positional[0] if positional else None) or os.environ.get("STARTGG_URL")
 
     if not url:
         # Use the token owner's tournaments
@@ -111,6 +128,8 @@ def _main() -> None:
         with console.status("Fetching tournament..."):
             tournament = client.get_tournament_and_events(tournament_slug)
 
+        owner_id = (tournament.get("owner") or {}).get("id")
+
         if event_slug:
             full_slug = f"tournament/{tournament_slug}/event/{event_slug}"
             with console.status("Fetching event..."):
@@ -119,17 +138,18 @@ def _main() -> None:
             console.print(f"Event:      [cyan]{chosen_event['name']}[/cyan]\n")
 
             series_name = seed_module.extract_series_name(tournament["name"])
-            console.print(f"Searching series: [dim]{series_name}[/dim]")
-            with console.status("Fetching historical tournaments..."):
-                historical = client.search_tournaments_by_name(series_name, per_page=6)
+            console.print(f"Searching series: [dim]{series_name}[/dim] (owner {owner_id})")
+            historical = _fetch_historical(console, client, owner_id, series_name)
 
             # Jump straight to standings — event already resolved
-            _run_seeding(console, client, tournament, chosen_event, historical, series_name)
+            _run_seeding(
+                console, client, tournament, chosen_event, historical, series_name, verbose
+            )
             return
 
         series_name = seed_module.extract_series_name(tournament["name"])
-        with console.status("Fetching historical tournaments..."):
-            historical = client.search_tournaments_by_name(series_name, per_page=6)
+        console.print(f"Searching series: [dim]{series_name}[/dim] (owner {owner_id})")
+        historical = _fetch_historical(console, client, owner_id, series_name)
 
         events = tournament.get("events") or []
 
@@ -147,7 +167,25 @@ def _main() -> None:
 
     console.print(f"Event:      [cyan]{chosen_event['name']}[/cyan]\n")
 
-    _run_seeding(console, client, tournament, chosen_event, historical, series_name)
+    _run_seeding(
+        console, client, tournament, chosen_event, historical, series_name, verbose
+    )
+
+
+def _fetch_historical(
+    console: Console,
+    client: StartGGClient,
+    owner_id: int | None,
+    series_name: str,
+) -> list[dict]:
+    if owner_id:
+        with console.status("Fetching historical tournaments (by owner)..."):
+            results = client.search_tournaments_by_owner(int(owner_id), per_page=20)
+        if results:
+            return results
+        console.print("[yellow]Owner lookup returned nothing, falling back to name search.[/yellow]")
+    with console.status("Fetching historical tournaments (by name)..."):
+        return client.search_tournaments_by_name(series_name, per_page=20)
 
 
 def _run_seeding(
@@ -157,7 +195,11 @@ def _run_seeding(
     chosen_event: dict,
     historical: list[dict],
     series_name: str,
+    verbose: bool = False,
 ) -> None:
+    def vprint(msg: str) -> None:
+        if verbose:
+            console.print(f"[dim cyan]│[/dim cyan] {msg}")
     historical = [
         t for t in historical
         if t["name"].lower().startswith(series_name.lower())
@@ -195,13 +237,21 @@ def _run_seeding(
             None,
         )
 
-    all_standings: list[list[dict]] = []
+    def _map_tag(p: dict) -> str | None:
+        # Prefer user ID match (handles tag changes), fall back to tag.
+        hist_tag = p.get("gamerTag")
+        user_id = (p.get("user") or {}).get("id")
+        return user_id_to_tag.get(user_id) or (hist_tag if hist_tag in entrant_tags else None)
+
     player_placements: dict[str, list[int]] = {}
+    player_attendance: dict[str, list[int]] = {}
+    matchups: dict[frozenset[str], list[int]] = {}
+    ts_to_name: dict[int, str] = {}
 
     console.print(f"Series tournaments found: [dim]{', '.join(h['name'] for h in historical)}[/dim]")
 
     hist_log: list[str] = []
-    with console.status("Fetching historical standings..."):
+    with console.status("Fetching historical standings & brackets..."):
         for hist in historical:
             if hist["id"] == tournament["id"]:
                 continue
@@ -213,66 +263,136 @@ def _run_seeding(
             if not standings:
                 hist_log.append(f"[dim]{hist['name']}: no standings[/dim]")
                 continue
-            hist_log.append(f"{hist['name']}: {len(standings)} results")
-            all_standings.append(standings)
+            hist_ts = hist.get("startAt") or 0
+            ts_to_name[hist_ts] = hist["name"]
             for entry in standings:
                 try:
-                    p = entry["entrant"]["participants"][0]
-                    hist_tag = p["gamerTag"]
-                    user_id = (p.get("user") or {}).get("id")
-                    # Prefer user ID match (handles tag changes), fall back to tag
-                    tag = user_id_to_tag.get(user_id) or (hist_tag if hist_tag in entrant_tags else None)
-                    if tag is None:
-                        continue
+                    tag = _map_tag(entry["entrant"]["participants"][0])
                 except (KeyError, IndexError):
                     continue
+                if tag is None:
+                    continue
                 player_placements.setdefault(tag, []).append(entry["placement"])
+                player_attendance.setdefault(tag, []).append(hist_ts)
+
+            # Actual round-1 matchups from the bracket.
+            r1_sets = client.get_event_round1_sets(matching["id"])
+            r1_count = 0
+            for s in r1_sets:
+                tags = []
+                for slot in s.get("slots") or []:
+                    entrant = slot.get("entrant") or {}
+                    parts = entrant.get("participants") or []
+                    if parts and (mapped := _map_tag(parts[0])):
+                        tags.append(mapped)
+                if len(tags) == 2 and tags[0] != tags[1]:
+                    matchups.setdefault(frozenset(tags), []).append(hist_ts)
+                    r1_count += 1
+                    vprint(
+                        f"R1 match in [b]{hist['name']}[/b]: {tags[0]} vs {tags[1]}"
+                    )
+            hist_log.append(f"{hist['name']}: {len(standings)} results, {r1_count} R1 matches")
 
     for line in hist_log:
         console.print(f"  {line}")
+
+    event_count = len({ts for tss in player_attendance.values() for ts in tss})
 
     # Keep only current entrants; give unranked players an empty history
     player_placements = {tag: player_placements.get(tag, []) for tag in entrant_tags}
 
     console.print(
-        f"Found [bold]{len(all_standings)}[/bold] historical event(s), "
+        f"Found [bold]{event_count}[/bold] historical event(s), "
         f"[bold]{sum(1 for v in player_placements.values() if v)}[/bold] with history.\n"
     )
 
-    matchups = seed_module.build_recent_matchups(all_standings[:2])
     scores = seed_module.compute_scores(player_placements)
+
+    if verbose:
+        console.print("[bold cyan]── verbose ──[/bold cyan]")
+        vprint(f"Flagged R1 rematch pairs ([b]{len(matchups)}[/b], DQs excluded):")
+        for pair, dates in sorted(matchups.items(), key=lambda kv: max(kv[1]), reverse=True):
+            x, y = tuple(pair)
+            when = ", ".join(ts_to_name.get(d, "?") for d in sorted(dates, reverse=True))
+            vprint(f"    {x} vs {y} — {when}")
+        vprint("Score order before rematch avoidance:")
+        for i, t in enumerate(sorted(scores, key=lambda t: scores[t], reverse=True), 1):
+            vprint(f"    {i:>2}. {t} ([dim]{scores[t]:.3f}[/dim])")
+        vprint("Resolving R1 conflicts (seeds 1-2 locked):")
+
+    trace: list[str] | None = [] if verbose else None
     seed_list = seed_module.build_seed_list(
-        scores, player_placements, matchups, len(player_placements)
+        scores,
+        player_placements,
+        matchups,
+        player_attendance,
+        len(player_placements),
+        trace=trace,
     )
+
+    if trace is not None:
+        for line in trace:
+            vprint(f"    {line}")
+        console.print("[bold cyan]─────────────[/bold cyan]\n")
 
     table = Table(title="Proposed Seeding", header_style="bold magenta")
     table.add_column("Seed", style="bold", width=6)
     table.add_column("Player", min_width=20)
     table.add_column("Score", justify="right", width=8)
     table.add_column("Recent Placements", min_width=18)
-    table.add_column("Conflicts", min_width=16)
 
     for entry in seed_list:
         placements_str = ", ".join(
             f"[green]{p}[/green]" if p == 1 else str(p)
             for p in entry["placements"][:5]
         )
-        conflicts_str = (
-            f"[red]{', '.join(entry['conflicts'])}[/red]"
-            if entry["conflicts"]
-            else "[green]none[/green]"
-        )
         table.add_row(
             str(entry["seed"]),
             entry["tag"],
             f"{entry['score']:.3f}",
             placements_str,
-            conflicts_str,
         )
 
     console.print(table)
 
-    if not Confirm.ask("\nApply this seeding to start.gg?"):
+    now = int(datetime.now().timestamp())
+    week_ago = now - 7 * 86400
+    seen: set[frozenset[str]] = set()
+    rematch_lines: list[tuple[tuple[int, int], str]] = []
+    for entry in seed_list:
+        for r in entry["rematches"]:
+            pair = frozenset({entry["tag"], r["opponent"]})
+            if pair in seen:
+                continue
+            seen.add(pair)
+            last_shared = r["last_shared"]
+            ago = _format_ago(now - last_shared) if last_shared else "unknown"
+            min_gap = r["min_gap"]
+            last_for = r["last_for"]
+            both_recent = all(
+                max(player_attendance.get(p, []), default=0) >= week_ago
+                for p in (entry["tag"], r["opponent"])
+            )
+            if both_recent:
+                tail = ""
+            elif len(last_for) == 1:
+                tail = f" — {last_for[0]}'s last appearance"
+            elif len(last_for) == 2:
+                tail = " — both players' last appearance"
+            else:
+                tail = ""
+            rematch_lines.append(
+                ((-min_gap, last_shared), f"{entry['tag']} vs {r['opponent']} ({ago}){tail}")
+            )
+
+    if rematch_lines:
+        console.print("\n[bold]R1 rematches:[/bold]")
+        for _, line in sorted(rematch_lines, reverse=True):
+            console.print(f"  [red]{line}[/red]")
+    else:
+        console.print("\n[green]No R1 rematches.[/green]")
+
+    if not Confirm.ask("\nApply this seeding to start.gg?", default=False):
         console.print("[yellow]Cancelled.[/yellow]")
         return
 

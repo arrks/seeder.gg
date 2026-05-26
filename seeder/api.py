@@ -3,6 +3,17 @@ import time
 import httpx
 
 
+def _is_dq(set_node: dict) -> bool:
+    """A set is a DQ if start.gg labels it 'DQ' or a slot's score is -1."""
+    if (set_node.get("displayScore") or "").strip().upper() == "DQ":
+        return True
+    for slot in set_node.get("slots") or []:
+        score = (((slot.get("standing") or {}).get("stats") or {}).get("score") or {}).get("value")
+        if score == -1:
+            return True
+    return False
+
+
 class StartGGClient:
     BASE_URL = "https://api.start.gg/gql/alpha"
 
@@ -21,7 +32,10 @@ class StartGGClient:
             if resp.status_code == 429 and attempt == 0:
                 time.sleep(2)
                 continue
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"start.gg API {resp.status_code}: {resp.text[:500]}"
+                )
             data = resp.json()
             if "errors" in data:
                 raise RuntimeError(f"GraphQL error: {data['errors']}")
@@ -190,6 +204,51 @@ class StartGGClient:
             )
             nodes = data["event"]["standings"]["nodes"]
             all_nodes.extend(nodes)
+            if len(nodes) < per_page:
+                break
+            page += 1
+        return all_nodes
+
+    def get_event_round1_sets(self, event_id: int, per_page: int = 32) -> list[dict]:
+        """Return round-1 sets (winners round 1) that were actually played.
+
+        Skips DQs — a round-1 no-show isn't a real match, so it shouldn't count
+        as a rematch.
+        """
+        all_nodes: list[dict] = []
+        page = 1
+        while True:
+            data = self._query(
+                """
+                query EventSets($eventId: ID!, $page: Int!, $perPage: Int!) {
+                  event(id: $eventId) {
+                    sets(page: $page, perPage: $perPage, sortType: STANDARD) {
+                      nodes {
+                        round
+                        displayScore
+                        slots {
+                          standing { stats { score { value } } }
+                          entrant {
+                            participants {
+                              gamerTag
+                              user { id }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                """,
+                {"eventId": event_id, "page": page, "perPage": per_page},
+            )
+            sets = (data.get("event") or {}).get("sets")
+            if not sets:
+                break
+            nodes = sets.get("nodes") or []
+            all_nodes.extend(
+                n for n in nodes if n.get("round") == 1 and not _is_dq(n)
+            )
             if len(nodes) < per_page:
                 break
             page += 1
