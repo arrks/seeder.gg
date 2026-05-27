@@ -1,4 +1,5 @@
 import re
+from math import log2
 
 
 def extract_series_name(name: str) -> str:
@@ -7,12 +8,25 @@ def extract_series_name(name: str) -> str:
 
 
 def compute_scores(
-    player_placements: dict[str, list[int]], decay: float = 0.7
+    player_history: dict[str, list[tuple[int, int, int]]],
+    decay: float = 0.7,
 ) -> dict[str, float]:
-    return {
-        tag: sum((1 / p) * (decay**i) for i, p in enumerate(placements))
-        for tag, placements in player_placements.items()
-    }
+    """Recency-weighted log2(attendance/placement), floored at 0.
+
+    Each history entry is (placement, attendance, ts). Bigger fields are
+    worth more; mid-pack finishes at large events don't drag a player down
+    below zero. Entries are decayed by index after sorting most-recent-first.
+    """
+    scores: dict[str, float] = {}
+    for tag, history in player_history.items():
+        ordered = sorted(history, key=lambda x: x[2], reverse=True)
+        total = 0.0
+        for i, (p, n, _) in enumerate(ordered):
+            if not p or not n or p <= 0 or n <= 0:
+                continue
+            total += max(0.0, log2(n / p)) * (decay ** i)
+        scores[tag] = total
+    return scores
 
 
 def next_power_of_two(n: int) -> int:
@@ -25,9 +39,11 @@ def bracket_round1_opponent(seed: int, bracket_size: int) -> int:
 
 _NO_REMATCH = (10**9, 0)
 
-# Largest contiguous seat block we'll cyclically rotate to break a rematch. This is a
-# performance bound, not a tuning knob — score deviation decides which move actually wins.
-_MAX_ROTATION_BLOCK = 5
+# A rematch where both players have attended this many or more other tournaments
+# since last meeting is treated as no longer competitively fresh — neither player
+# walked in last week expecting to face the other, so forcing a swap to break it
+# only costs score deviation for marginal benefit.
+_STALE_GAP = 6
 
 
 def pair_freshness(
@@ -81,6 +97,35 @@ def _resolve_conflicts(
     ideal_at_seat = [scores[t] for t in ordered]
     sentinel = (-_NO_REMATCH[0], _NO_REMATCH[1])
     irreducible: set[frozenset[str]] = set()
+    # Pairs whose last R1 meeting is far enough back that we no longer treat them
+    # as a competitive freshness concern. Computed once: freshness depends only on
+    # matchups + attendance, both immutable across passes.
+    stale_pairs: set[frozenset[str]] = {
+        pair for pair in matchups
+        if -pair_freshness(pair, matchups, player_attendance)[0] >= _STALE_GAP
+    }
+    if trace is not None and stale_pairs:
+        initial_stale: list[tuple[int, str, str]] = []
+        seen_stale_seats: set[tuple[int, int]] = set()
+        for i in range(locked, entrant_count):
+            j = bracket_round1_opponent(i + 1, bracket_size) - 1
+            if not (0 <= j < entrant_count):
+                continue
+            seats = (min(i, j), max(i, j))
+            if seats in seen_stale_seats:
+                continue
+            seen_stale_seats.add(seats)
+            pair = frozenset({ordered[i], ordered[j]})
+            if pair in stale_pairs:
+                gap = -pair_freshness(pair, matchups, player_attendance)[0]
+                initial_stale.append((gap, ordered[i], ordered[j]))
+        if initial_stale:
+            log(
+                f"ignoring {len(initial_stale)} stale R1 rematch(es) at initial "
+                f"seeding (gap >= {_STALE_GAP}):"
+            )
+            for g, x, y in sorted(initial_stale, reverse=True):
+                log(f"    {x} vs {y} (gap={g})")
     for _ in range(entrant_count * 4):
         # A movable seat (>= locked) facing a rematch counts as a conflict even when its
         # R1 opponent is a locked top seed — we just can't move the locked side to fix it.
@@ -95,7 +140,7 @@ def _resolve_conflicts(
                 continue
             seen_seats.add(seats)
             pair = frozenset({ordered[i], ordered[j]})
-            if pair in matchups and pair not in irreducible:
+            if pair in matchups and pair not in irreducible and pair not in stale_pairs:
                 pairs.append((freshness_key(pair), seats[0], seats[1]))
         if not pairs:
             break
@@ -104,14 +149,15 @@ def _resolve_conflicts(
         target_pair = frozenset({ordered[a], ordered[b]})
         gap = -target_key[0]
         log(
-            f"conflict: seed {a + 1} ({ordered[a]}) vs seed {b + 1} ({ordered[b]}) "
-            f"— played in R1 before (gap={gap})"
+            f"pass: {len(pairs)} conflict(s) remaining; "
+            f"freshest = seed {a + 1} ({ordered[a]}) vs seed {b + 1} ({ordered[b]}) "
+            f"(gap={gap})"
         )
 
-        # Try a move set — any-distance pairwise swaps plus cyclic rotations of short
-        # contiguous blocks — and pick the least-disruptive one that strictly reduces the
-        # freshest conflict. Cost: avoid leaving a fresh rematch among touched seats, then
-        # minimise total score deviation from the ideal profile, then total seat movement.
+        # Try every pairwise swap involving a movable side of the conflict and pick
+        # the least-disruptive one that strictly reduces the freshest conflict. Cost:
+        # avoid leaving a fresh rematch among touched seats, then minimise total
+        # score deviation from the ideal profile, then total seat movement.
         def evaluate(touched: tuple[int, ...]) -> tuple[int, float, int, tuple[int, int]] | None:
             # `ordered` is already mutated. Only touched seats changed occupants, so only
             # their R1 pairs can have changed — checking those covers target breakage too.
@@ -132,71 +178,78 @@ def _resolve_conflicts(
         def apply_swap(i: int, k: int) -> None:
             ordered[i], ordered[k] = ordered[k], ordered[i]
 
-        def apply_rot(lo: int, hi: int, direction: int) -> None:
-            seg = ordered[lo : hi + 1]
-            ordered[lo : hi + 1] = (
-                [seg[-1]] + seg[:-1] if direction == 1 else seg[1:] + [seg[0]]
+        # best = (cost, (i, k)); params re-apply the swap on the unmutated `ordered`.
+        best: tuple[tuple[int, float, int, tuple[int, int]], tuple[int, int]] | None = None
+        conflict_seats = [s for s in (a, b) if s >= locked]
+        # Trace-only bookkeeping: collect every viable candidate so we can report
+        # the runners-up alongside the winner.
+        candidates: list[tuple[tuple[int, float, int, tuple[int, int]], tuple[int, int]]] = []
+        swap_tried = swap_viable = 0
+
+        def describe(params: tuple[int, int]) -> str:
+            i, k = params
+            return (
+                f"swap {ordered[i]} (seed {i + 1}) ↔ "
+                f"{ordered[k]} (seed {k + 1})"
             )
 
-        # best = (cost, kind, params); params re-apply the move on the unmutated `ordered`.
-        best: tuple[tuple[int, float, int, tuple[int, int]], str, tuple] | None = None
-        conflict_seats = [s for s in (a, b) if s >= locked]
-
-        def offer(cost, kind: str, params: tuple) -> None:
+        def offer(cost, params: tuple[int, int]) -> None:
             nonlocal best
-            if cost is not None and (best is None or cost < best[0]):
-                best = (cost, kind, params)
+            if cost is None:
+                return
+            if best is None or cost < best[0]:
+                best = (cost, params)
+            if trace is not None:
+                candidates.append((cost, params))
 
         # Pairwise swaps: relocate a movable side of the conflict anywhere.
         for anchor in conflict_seats:
             for k in range(locked, entrant_count):
                 if k == a or k == b:
                     continue
+                swap_tried += 1
                 apply_swap(anchor, k)
                 cost = evaluate((anchor, k))
                 apply_swap(anchor, k)
-                offer(cost, "swap", (anchor, k))
+                if cost is not None:
+                    swap_viable += 1
+                offer(cost, (anchor, k))
 
-        # Cyclic rotations of a short contiguous block that includes a conflict seat —
-        # lets a chain of near-equal players each shift one spot instead of one player
-        # absorbing the whole move.
-        for size in range(3, min(_MAX_ROTATION_BLOCK, entrant_count - locked) + 1):
-            for lo in range(locked, entrant_count - size + 1):
-                hi = lo + size - 1
-                if not any(lo <= cs <= hi for cs in conflict_seats):
-                    continue
-                for direction in (1, -1):
-                    apply_rot(lo, hi, direction)
-                    cost = evaluate(tuple(range(lo, hi + 1)))
-                    apply_rot(lo, hi, -direction)
-                    offer(cost, "rot", (lo, hi, direction))
+        if trace is not None:
+            log(f"  candidates: {swap_viable}/{swap_tried} swaps viable")
+            if candidates:
+                candidates.sort(key=lambda c: c[0])
+                shown = min(3, len(candidates))
+                log(f"  top {shown} by cost (creates_new, score_dev, idx_disp):")
+                for cost, params in candidates[:shown]:
+                    creates, sd, idx, _ = cost
+                    log(f"    [{creates}, {sd:.3f}, {idx}] {describe(params)}")
 
         if best is None:
             # This pair can't be improved without making things worse; leave it and
             # move on to the next-freshest pair.
             irreducible.add(target_pair)
             x, y = tuple(target_pair)
-            log(f"  → could not break without a fresher conflict; left {x} vs {y}")
+            log(
+                f"  → irreducible: no candidate strictly improves over the target "
+                f"freshness; left {x} vs {y} in place"
+            )
             continue
 
-        (_, score_dev, _, _), kind, params = best
-        if kind == "swap":
-            i, k = params
-            members = f"{ordered[i]} (seed {i + 1}) ↔ {ordered[k]} (seed {k + 1})"
-            apply_swap(i, k)
-        else:
-            lo, hi, direction = params
-            arrow = "↓" if direction == 1 else "↑"
-            members = f"seeds {lo + 1}-{hi + 1} ({arrow})"
-            apply_rot(lo, hi, direction)
-        log(f"  → {members}; score deviation {score_dev:.3f}")
+        (creates, score_dev, idx_disp, _), params = best
+        move_desc = describe(params)
+        apply_swap(*params)
+        log(
+            f"  → chose {move_desc} "
+            f"(creates_new={creates}, score_dev={score_dev:.3f}, idx_disp={idx_disp})"
+        )
 
     return ordered
 
 
 def build_seed_list(
     scores: dict[str, float],
-    player_placements: dict[str, list[int]],
+    player_history: dict[str, list[tuple[int, int, int]]],
     matchups: dict[frozenset[str], list[int]],
     player_attendance: dict[str, list[int]],
     entrant_count: int,
@@ -207,7 +260,7 @@ def build_seed_list(
 
     ordered = _resolve_conflicts(
         ordered, scores, matchups, player_attendance, bracket_size, entrant_count,
-        locked=2, trace=trace,
+        locked=3, trace=trace,
     )
 
     result = []
@@ -234,12 +287,14 @@ def build_seed_list(
                         "last_for": last_for,
                     }
                 )
+        history = sorted(player_history.get(tag, []), key=lambda x: x[2], reverse=True)
+        placements = [p for p, _, _ in history]
         result.append(
             {
                 "seed": seed,
                 "tag": tag,
                 "score": scores[tag],
-                "placements": player_placements.get(tag, []),
+                "placements": placements,
                 "rematches": rematches,
             }
         )

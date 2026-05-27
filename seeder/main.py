@@ -210,6 +210,7 @@ def _run_seeding(
 
     entrant_tags: set[str] = set()
     user_id_to_tag: dict[int, str] = {}
+    tag_to_player_id: dict[str, int] = {}
     for entrant in entrants:
         try:
             p = entrant["participants"][0]
@@ -218,6 +219,9 @@ def _run_seeding(
             user_id = (p.get("user") or {}).get("id")
             if user_id:
                 user_id_to_tag[user_id] = tag
+            player_id = (p.get("player") or {}).get("id")
+            if player_id:
+                tag_to_player_id[tag] = player_id
         except (KeyError, IndexError):
             continue
 
@@ -227,15 +231,30 @@ def _run_seeding(
 
     console.print(f"Entrants: [bold]{len(entrant_tags)}[/bold]")
 
-    # Build a name key for the chosen event: strip time/parenthetical suffix
-    # e.g. "Game Title (19h/7pm)" -> "game title"
-    chosen_base = re.split(r"[\(\|]", chosen_event["name"])[0].strip().lower()
+    chosen_game_id = (chosen_event.get("videogame") or {}).get("id")
+    chosen_event_type = chosen_event.get("type")
+    type_label = {1: "singles", 5: "teams"}.get(chosen_event_type, f"type {chosen_event_type}")
+    if chosen_game_id is None:
+        console.print(
+            "[yellow]Warning: chosen event has no videogame id — series and per-player "
+            "history will be empty.[/yellow]"
+        )
+    else:
+        console.print(f"Game:       [cyan]id={chosen_game_id}[/cyan] [dim]({type_label})[/dim]")
 
     def _match_hist_event(events: list[dict]) -> dict | None:
-        return next(
-            (e for e in events if e["name"].lower().startswith(chosen_base)),
-            None,
-        )
+        if chosen_game_id is None:
+            return None
+        candidates = [
+            e for e in events
+            if (e.get("videogame") or {}).get("id") == chosen_game_id
+            and e.get("type") == chosen_event_type
+        ]
+        if not candidates:
+            return None
+        # Multiple events for the same (game, type) in one tournament — e.g. main
+        # bracket plus a beginner bracket. Take the largest; that's the main event.
+        return max(candidates, key=lambda e: e.get("numEntrants") or 0)
 
     def _map_tag(p: dict) -> str | None:
         # Prefer user ID match (handles tag changes), fall back to tag.
@@ -243,7 +262,7 @@ def _run_seeding(
         user_id = (p.get("user") or {}).get("id")
         return user_id_to_tag.get(user_id) or (hist_tag if hist_tag in entrant_tags else None)
 
-    player_placements: dict[str, list[int]] = {}
+    series_history: dict[str, list[tuple[int, int, int]]] = {}
     player_attendance: dict[str, list[int]] = {}
     matchups: dict[frozenset[str], list[int]] = {}
     ts_to_name: dict[int, str] = {}
@@ -265,6 +284,7 @@ def _run_seeding(
                 continue
             hist_ts = hist.get("startAt") or 0
             ts_to_name[hist_ts] = hist["name"]
+            n_entrants = matching.get("numEntrants") or 0
             for entry in standings:
                 try:
                     tag = _map_tag(entry["entrant"]["participants"][0])
@@ -272,12 +292,15 @@ def _run_seeding(
                     continue
                 if tag is None:
                     continue
-                player_placements.setdefault(tag, []).append(entry["placement"])
+                series_history.setdefault(tag, []).append(
+                    (entry["placement"], n_entrants, hist_ts)
+                )
                 player_attendance.setdefault(tag, []).append(hist_ts)
 
             # Actual round-1 matchups from the bracket.
             r1_sets = client.get_event_round1_sets(matching["id"])
             r1_count = 0
+            seen_pairs: set[frozenset[str]] = set()
             for s in r1_sets:
                 tags = []
                 for slot in s.get("slots") or []:
@@ -286,7 +309,11 @@ def _run_seeding(
                     if parts and (mapped := _map_tag(parts[0])):
                         tags.append(mapped)
                 if len(tags) == 2 and tags[0] != tags[1]:
-                    matchups.setdefault(frozenset(tags), []).append(hist_ts)
+                    pair = frozenset(tags)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    matchups.setdefault(pair, []).append(hist_ts)
                     r1_count += 1
                     vprint(
                         f"R1 match in [b]{hist['name']}[/b]: {tags[0]} vs {tags[1]}"
@@ -298,15 +325,64 @@ def _run_seeding(
 
     event_count = len({ts for tss in player_attendance.values() for ts in tss})
 
-    # Keep only current entrants; give unranked players an empty history
-    player_placements = {tag: player_placements.get(tag, []) for tag in entrant_tags}
+    # For entrants with a linked player.id, prefer cross-tournament history filtered
+    # by videogame.id (broader skill signal). Series history is the fallback for
+    # entrants without a linked account.
+    player_history: dict[str, list[tuple[int, int, int]]] = {}
+    linked = 0
+    fell_back = 0
+    if chosen_game_id is not None:
+        linked_ids = sorted({tag_to_player_id[t] for t in entrant_tags if t in tag_to_player_id})
+        standings_by_pid: dict[int, list[dict]] = {}
+        if linked_ids:
+            with console.status(
+                f"Fetching per-player game history ({len(linked_ids)} players)..."
+            ):
+                try:
+                    standings_by_pid = client.get_players_recent_standings(
+                        linked_ids, int(chosen_game_id), limit=10
+                    )
+                except RuntimeError as exc:
+                    console.print(
+                        f"[yellow]Batched player history fetch failed ({exc}); "
+                        f"all linked entrants will use series fallback.[/yellow]"
+                    )
+        for tag in entrant_tags:
+            pid = tag_to_player_id.get(tag)
+            if pid is None:
+                series_hist = series_history.get(tag, [])
+                player_history[tag] = series_hist
+                vprint(f"{tag}: no linked account, series fallback ({len(series_hist)})")
+                continue
+            standings = standings_by_pid.get(pid, [])
+            hist: list[tuple[int, int, int]] = []
+            for s in standings:
+                ev = s.get("event") or {}
+                if ev.get("id") == chosen_event["id"]:
+                    continue
+                p, n, ts = s.get("placement"), ev.get("numEntrants"), ev.get("startAt")
+                if p and n and ts:
+                    hist.append((p, n, ts))
+            if hist:
+                player_history[tag] = hist
+                linked += 1
+                vprint(f"{tag}: {len(hist)} cross-tournament result(s)")
+            else:
+                series_hist = series_history.get(tag, [])
+                player_history[tag] = series_hist
+                fell_back += 1
+                vprint(f"{tag}: no game-wide history, series fallback ({len(series_hist)})")
+    else:
+        player_history = {tag: series_history.get(tag, []) for tag in entrant_tags}
 
     console.print(
-        f"Found [bold]{event_count}[/bold] historical event(s), "
-        f"[bold]{sum(1 for v in player_placements.values() if v)}[/bold] with history.\n"
+        f"Found [bold]{event_count}[/bold] series event(s); "
+        f"[bold]{linked}[/bold]/{len(entrant_tags)} via cross-tournament history, "
+        f"[bold]{fell_back}[/bold] via series fallback, "
+        f"[bold]{sum(1 for v in player_history.values() if v)}[/bold] scored.\n"
     )
 
-    scores = seed_module.compute_scores(player_placements)
+    scores = seed_module.compute_scores(player_history)
 
     if verbose:
         console.print("[bold cyan]── verbose ──[/bold cyan]")
@@ -318,15 +394,15 @@ def _run_seeding(
         vprint("Score order before rematch avoidance:")
         for i, t in enumerate(sorted(scores, key=lambda t: scores[t], reverse=True), 1):
             vprint(f"    {i:>2}. {t} ([dim]{scores[t]:.3f}[/dim])")
-        vprint("Resolving R1 conflicts (seeds 1-2 locked):")
+        vprint("Resolving R1 conflicts (seeds 1-3 locked):")
 
     trace: list[str] | None = [] if verbose else None
     seed_list = seed_module.build_seed_list(
         scores,
-        player_placements,
+        player_history,
         matchups,
         player_attendance,
-        len(player_placements),
+        len(player_history),
         trace=trace,
     )
 

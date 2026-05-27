@@ -61,6 +61,8 @@ class StartGGClient:
                       id
                       name
                       type
+                      videogame { id }
+                      numEntrants
                     }
                   }
                 }
@@ -83,6 +85,8 @@ class StartGGClient:
                   id
                   name
                   type
+                  videogame { id }
+                  numEntrants
                 }
               }
             }
@@ -109,6 +113,8 @@ class StartGGClient:
                     id
                     name
                     type
+                    videogame { id }
+                    numEntrants
                   }
                 }
               }
@@ -126,6 +132,7 @@ class StartGGClient:
                 id
                 name
                 type
+                videogame { id }
               }
             }
             """,
@@ -146,6 +153,7 @@ class StartGGClient:
                         participants {
                           gamerTag
                           user { id }
+                          player { id }
                         }
                       }
                     }
@@ -272,6 +280,8 @@ class StartGGClient:
                     id
                     name
                     type
+                    videogame { id }
+                    numEntrants
                   }
                 }
               }
@@ -280,6 +290,83 @@ class StartGGClient:
             {"name": name_prefix, "perPage": per_page},
         )
         return data["tournaments"]["nodes"]
+
+    def get_players_recent_standings(
+        self,
+        player_ids: list[int],
+        videogame_id: int,
+        limit: int = 10,
+        chunk_size: int = 20,
+    ) -> dict[int, list[dict]]:
+        """Batched recent standings for many players at events of a given videogame.
+
+        Uses GraphQL aliases to fetch up to `chunk_size` players per HTTP request.
+        If start.gg rejects a chunk for exceeding query complexity, the chunk is
+        split in half and each half retried — so callers don't need to tune
+        `chunk_size` against a moving server-side limit. Returns
+        {player_id: [{placement, event: {id, numEntrants, startAt}}, ...]} with
+        only Event-container standings; players whose entry returned null are
+        mapped to an empty list.
+        """
+        results: dict[int, list[dict]] = {pid: [] for pid in player_ids}
+
+        def fetch(chunk: list[int]) -> None:
+            if not chunk:
+                return
+            var_decls = ", ".join(f"$p{i}: ID!" for i in range(len(chunk)))
+            fields = "\n".join(
+                f"""
+                p{i}: player(id: $p{i}) {{
+                  recentStandings(videogameId: $videogameId, limit: $limit) {{
+                    placement
+                    container {{
+                      __typename
+                      ... on Event {{ id numEntrants startAt }}
+                    }}
+                  }}
+                }}
+                """
+                for i in range(len(chunk))
+            )
+            query = (
+                f"query PlayersRecent($videogameId: ID!, $limit: Int!, {var_decls}) "
+                f"{{\n{fields}\n}}"
+            )
+            variables: dict = {"videogameId": videogame_id, "limit": limit}
+            for i, pid in enumerate(chunk):
+                variables[f"p{i}"] = pid
+            try:
+                data = self._query(query, variables)
+            except RuntimeError as exc:
+                if "complexity" in str(exc).lower() and len(chunk) > 1:
+                    mid = len(chunk) // 2
+                    fetch(chunk[:mid])
+                    fetch(chunk[mid:])
+                    return
+                raise
+            for i, pid in enumerate(chunk):
+                player = data.get(f"p{i}") or {}
+                standings = player.get("recentStandings") or []
+                out: list[dict] = []
+                for s in standings:
+                    c = s.get("container") or {}
+                    if c.get("__typename") != "Event":
+                        continue
+                    out.append(
+                        {
+                            "placement": s.get("placement"),
+                            "event": {
+                                "id": c.get("id"),
+                                "numEntrants": c.get("numEntrants"),
+                                "startAt": c.get("startAt"),
+                            },
+                        }
+                    )
+                results[pid] = out
+
+        for start in range(0, len(player_ids), chunk_size):
+            fetch(player_ids[start : start + chunk_size])
+        return results
 
     def get_phase_seeds(self, phase_id: int, per_page: int = 64) -> list[dict]:
         all_nodes: list[dict] = []
